@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -25,6 +26,7 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 			},
 			func(id pathID) { t.Fatal("didn't expect any connection ID to be retired") },
 			func() {},
+			context.Background(),
 		)
 
 		_, _, _, ok := pm.NextPathToProbe()
@@ -108,6 +110,46 @@ func TestPathManagerOutgoingPathProbing(t *testing.T) {
 	})
 }
 
+// When the connection is closed while a path probe is in flight,
+// Probe unblocks and returns the connection's close error.
+func TestPathManagerOutgoingProbeReturnsOnConnectionClose(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		connCtx, cancel := context.WithCancelCause(context.Background())
+		pm := newPathManagerOutgoing(
+			func(id pathID) (protocol.ConnectionID, bool) {
+				return protocol.ParseConnectionID([]byte{1, 2, 3, 4, 5, 6, 7, 8}), true
+			},
+			func(id pathID) {},
+			func() {},
+			connCtx,
+		)
+
+		p := pm.NewPath(&Transport{}, time.Second, func() {})
+
+		errChan := make(chan error, 1)
+		go func() { errChan <- p.Probe(context.Background()) }()
+
+		// wait for the probe to be sent
+		synctest.Wait()
+		_, _, _, ok := pm.NextPathToProbe()
+		require.True(t, ok)
+
+		select {
+		case <-errChan:
+			t.Fatal("should still be probing")
+		default:
+		}
+
+		// closing the connection unblocks the probe
+		connErr := errors.New("connection closed")
+		cancel(connErr)
+		require.ErrorIs(t, <-errChan, connErr)
+
+		// switching paths on a closed connection fails
+		require.ErrorIs(t, p.Switch(), ErrPathClosed)
+	})
+}
+
 func TestPathManagerOutgoingRetransmissions(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		connIDs := []protocol.ConnectionID{
@@ -120,6 +162,7 @@ func TestPathManagerOutgoingRetransmissions(t *testing.T) {
 			func(id pathID) (protocol.ConnectionID, bool) { return connIDs[id], true },
 			func(id pathID) { retiredConnIDs = append(retiredConnIDs, connIDs[id]) },
 			func() { scheduledSending <- struct{}{} },
+			context.Background(),
 		)
 
 		_, _, _, ok := pm.NextPathToProbe()
@@ -239,6 +282,7 @@ func TestPathManagerOutgoingAbandonPath(t *testing.T) {
 			},
 			func(id pathID) { retiredPaths = append(retiredPaths, id) },
 			func() {},
+			context.Background(),
 		)
 
 		// path abandoned before the PATH_CHALLENGE is sent out
@@ -307,6 +351,7 @@ func TestPathManagerOutgoingAbandonValidatedPath(t *testing.T) {
 			},
 			func(id pathID) { retiredPaths = append(retiredPaths, id) },
 			func() {},
+			context.Background(),
 		)
 
 		p := pm.NewPath(&Transport{}, time.Second, func() {})

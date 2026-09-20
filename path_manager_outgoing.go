@@ -35,6 +35,10 @@ type Path struct {
 	abandon    chan struct{}
 }
 
+// Probe probes the path by sending PATH_CHALLENGE frames, and returns once the
+// path has been validated by the peer.
+// If the connection is closed (e.g. because it timed out) before the path is
+// validated, Probe returns the connection's close error.
 func (p *Path) Probe(ctx context.Context) error {
 	path := p.pathManager.addPath(p, p.enablePath)
 
@@ -46,6 +50,10 @@ func (p *Path) Probe(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return context.Cause(ctx)
+		case <-p.pathManager.connCtx.Done():
+			// The connection was closed (e.g. it timed out) while probing.
+			// Surface the connection's close error instead of blocking forever.
+			return context.Cause(p.pathManager.connCtx)
 		case <-path.Validated():
 			p.validated.Store(true)
 			return nil
@@ -120,6 +128,11 @@ type pathManagerOutgoing struct {
 	retireConnID    func(pathID)
 	scheduleSending func()
 
+	// connCtx is the connection's context.
+	// It is cancelled (with the connection's close error as the cause) when the
+	// connection is closed, and unblocks Path.Probe.
+	connCtx context.Context
+
 	mx             sync.Mutex
 	activePath     pathID
 	pathsToProbe   []pathID
@@ -135,6 +148,7 @@ func newPathManagerOutgoing(
 	getConnID func(pathID) (_ protocol.ConnectionID, ok bool),
 	retireConnID func(pathID),
 	scheduleSending func(),
+	connCtx context.Context,
 ) *pathManagerOutgoing {
 	return &pathManagerOutgoing{
 		activePath:      0, // at initialization time, we're guaranteed to be using the handshake path
@@ -142,6 +156,7 @@ func newPathManagerOutgoing(
 		getConnID:       getConnID,
 		retireConnID:    retireConnID,
 		scheduleSending: scheduleSending,
+		connCtx:         connCtx,
 		paths:           make(map[pathID]*pathOutgoing, 4),
 	}
 }
@@ -199,6 +214,13 @@ func (pm *pathManagerOutgoing) removePathImpl(id pathID) error {
 func (pm *pathManagerOutgoing) switchToPath(id pathID) error {
 	pm.mx.Lock()
 	defer pm.mx.Unlock()
+
+	select {
+	case <-pm.connCtx.Done():
+		// The connection is already closed, no path switch will ever happen.
+		return ErrPathClosed
+	default:
+	}
 
 	p, ok := pm.paths[id]
 	if !ok {
