@@ -3089,6 +3089,7 @@ func (c *Conn) getPathManager() *pathManagerOutgoing {
 		c.connIDManager.GetConnIDForPath,
 		c.connIDManager.RetireConnIDForPath,
 		c.scheduleSending,
+		c.ctx,
 	)
 	if c.pathManagerOutgoing.CompareAndSwap(old, new) {
 		return new
@@ -3098,12 +3099,21 @@ func (c *Conn) getPathManager() *pathManagerOutgoing {
 	return c.pathManagerOutgoing.Load()
 }
 
+// AddPath adds a new network path to the connection.
+// The path needs to be validated by calling [Path.Probe] before it can be
+// switched to using [Path.Switch].
+// It returns an error if the connection is already closed.
 func (c *Conn) AddPath(t *Transport) (*Path, error) {
 	if c.perspective == protocol.PerspectiveServer {
 		return nil, errors.New("server cannot initiate connection migration")
 	}
 	if c.peerParams.DisableActiveMigration {
 		return nil, errors.New("server disabled connection migration")
+	}
+	select {
+	case <-c.ctx.Done():
+		return nil, context.Cause(c.ctx)
+	default:
 	}
 	if err := t.init(false); err != nil {
 		return nil, err
